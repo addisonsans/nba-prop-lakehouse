@@ -89,7 +89,7 @@ class Backfill:
         return body
 
     def day(self, d: date) -> dict:
-        stats = {"date": d.isoformat(), "games": 0, "props": 0, "h2h": 0}
+        stats = {"date": d.isoformat(), "games": 0, "props": 0, "h2h": 0, "missing": 0}
         prefix = f"raw/odds/{SPORT}/snapshot_date={d.isoformat()}"
         as_of = datetime(d.year, d.month, d.day, 10, tzinfo=ET).astimezone(timezone.utc)
 
@@ -108,8 +108,17 @@ class Backfill:
                 continue
             t = tip - BEFORE_TIP
             params = {"date": _iso(t), "regions": self.regions, "markets": self.markets, "oddsFormat": "american"}
-            if self._fetch(f"{prefix}/snapshot_ts={t:%Y%m%dT%H%M%SZ}/event={e['id']}.json.gz",
-                           f"{HIST}/events/{e['id']}/odds", params) is not None:
+            try:
+                fetched = self._fetch(f"{prefix}/snapshot_ts={t:%Y%m%dT%H%M%SZ}/event={e['id']}.json.gz",
+                                      f"{HIST}/events/{e['id']}/odds", params)
+            except http.HTTPStatusError as exc:
+                if exc.status != 404:
+                    raise
+                # Postponed/rescheduled games have no snapshot under this event id.
+                log.warning("no props snapshot for %s %s @ %s (%s)", e["id"], e.get("away_team"), e.get("home_team"), _iso(t))
+                stats["missing"] += 1
+                continue
+            if fetched is not None:
                 stats["props"] += 1
 
         for t in h2h_times([_parse(e["commence_time"]) for e in todays]):
@@ -133,11 +142,11 @@ def main(argv: list[str] | None = None) -> None:
 
     os.environ.setdefault("ODDS_API_KEY_PARAM", "/nba-lakehouse/odds-api-key")
     job = Backfill(Store(args.out), api_key(), min_credits=args.min_credits)
-    totals = {"days": 0, "games": 0, "props": 0, "h2h": 0}
+    totals = {"days": 0, "games": 0, "props": 0, "h2h": 0, "missing": 0}
     for d in game_days(args.start, args.end):
         stats = job.day(d)
         totals["days"] += 1
-        for k in ("games", "props", "h2h"):
+        for k in ("games", "props", "h2h", "missing"):
             totals[k] += stats[k]
         if stats["games"]:
             log.info("%s credits_remaining=%s", stats, job.remaining)

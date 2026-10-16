@@ -107,8 +107,8 @@ def test_backfill_day_fetches_todays_games_once(tmp_path, monkeypatch):
     calls_after_first = len(fake.calls)
     second = job.day(date(2024, 1, 15))
 
-    assert first == {"date": "2024-01-15", "games": 3, "props": 3, "h2h": 2}
-    assert second == {"date": "2024-01-15", "games": 3, "props": 0, "h2h": 0}
+    assert first == {"date": "2024-01-15", "games": 3, "props": 3, "h2h": 2, "missing": 0}
+    assert second == {"date": "2024-01-15", "games": 3, "props": 0, "h2h": 0, "missing": 0}
     assert len(fake.calls) == calls_after_first  # re-run spends nothing
     prop = read(tmp_path / "raw/odds/basketball_nba/snapshot_date=2024-01-15/snapshot_ts=20240115T171000Z/event=g0.json.gz")
     assert prop["data"] == {"markets": "player_points"} and prop["_meta"]["historical"] is True
@@ -119,7 +119,7 @@ def test_backfill_day_fetches_todays_games_once(tmp_path, monkeypatch):
 def test_backfill_skips_props_before_they_exist(tmp_path, monkeypatch):
     monkeypatch.setattr(backfill.http, "get_json", _backfill_fake(["2023-01-10T00:00:00Z"]))
     stats = backfill.Backfill(Store(str(tmp_path)), "k", pause=0).day(date(2023, 1, 9))
-    assert stats == {"date": "2023-01-09", "games": 1, "props": 0, "h2h": 1}
+    assert stats == {"date": "2023-01-09", "games": 1, "props": 0, "h2h": 1, "missing": 0}
 
 
 def test_backfill_stops_at_credit_reserve(tmp_path, monkeypatch):
@@ -127,6 +127,21 @@ def test_backfill_stops_at_credit_reserve(tmp_path, monkeypatch):
     with pytest.raises(odds.CreditsExhausted):
         backfill.Backfill(Store(str(tmp_path)), "k", pause=0, min_credits=5000).day(date(2024, 1, 15))
     assert not list(tmp_path.rglob("event=*.json.gz"))
+
+
+def test_backfill_skips_games_with_no_props_snapshot(tmp_path, monkeypatch):
+    fake = _backfill_fake(["2024-01-16T00:00:00Z", "2024-01-16T01:00:00Z"])
+    inner = fake.routes["/odds"]
+    def odds_route(params):
+        if params["markets"] == "player_points" and params["date"] == "2024-01-15T23:00:00Z":
+            raise backfill.http.HTTPStatusError("HTTP 404 from api.the-odds-api.com", 404)
+        return inner(params)
+    fake.routes["/odds"] = odds_route
+    monkeypatch.setattr(backfill.http, "get_json", fake)
+
+    stats = backfill.Backfill(Store(str(tmp_path)), "k", pause=0).day(date(2024, 1, 15))
+
+    assert stats == {"date": "2024-01-15", "games": 2, "props": 1, "h2h": 1, "missing": 1}
 
 
 def test_backfill_calendar_helpers():

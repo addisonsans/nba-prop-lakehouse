@@ -11,6 +11,12 @@ import urllib.request
 USER_AGENT = "nba-prop-lakehouse/0.1 (portfolio data project)"
 
 
+class HTTPStatusError(RuntimeError):
+    def __init__(self, message: str, status: int):
+        super().__init__(message)
+        self.status = status
+
+
 def get_json(
     url: str,
     params: dict | None = None,
@@ -37,7 +43,7 @@ def get_json(
         except urllib.error.HTTPError as exc:
             retryable = exc.code == 429 or exc.code >= 500
             if not retryable or attempt == retries - 1:
-                raise RuntimeError(f"HTTP {exc.code} from {urllib.parse.urlsplit(url).netloc}") from None
+                raise HTTPStatusError(f"HTTP {exc.code} from {urllib.parse.urlsplit(url).netloc}", exc.code) from None
         except (urllib.error.URLError, TimeoutError) as exc:
             if attempt == retries - 1:
                 raise RuntimeError(f"Network error calling {urllib.parse.urlsplit(url).netloc}: {exc}") from None
