@@ -1,0 +1,19 @@
+# Terraform: state can contain resource details; tfvars holds your email
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+infra/terraform/build/
+tfplan
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# Local data pulls
+data/
+.DS_Store

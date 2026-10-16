@@ -1,0 +1,76 @@
+# NBA Prop Lakehouse
+
+Free historical NBA player-prop data barely exists, so this project collects
+its own: a daily AWS pipeline snapshots prop lines, box scores and injury
+reports into S3, and Databricks turns them into a lakehouse for modeling
+player-points distributions.
+
+```
+EventBridge Scheduler (ET)
+ ├─ 5:00pm ─> Lambda nba-lakehouse-odds      ─> The Odds API (player_points) + ESPN injuries ─┐
+ └─ 6:00am ─> Lambda nba-lakehouse-boxscores ─> ESPN scoreboard + game summaries ─────────────┤
+                                                                                              v
+                                                      S3  raw/  (gzipped JSON, Hive-style partitions)
+                                                                                              │
+                                     Databricks: bronze -> silver -> gold -> MLflow model  <──┘  (phase 2)
+CloudWatch alarm on any Lambda error -> SNS email · AWS Budget alert at $5/month
+```
+
+## Raw zone layout
+
+| Path | What | Written by |
+|------|------|------------|
+| `raw/odds/basketball_nba/snapshot_date=/snapshot_ts=/events.json.gz` | Upcoming games (free call) | odds |
+| `raw/odds/basketball_nba/snapshot_date=/snapshot_ts=/event=<id>.json.gz` | Player-points lines per book | odds |
+| `raw/espn/injuries/snapshot_date=/snapshot_ts=.json.gz` | League injury report | odds |
+| `raw/espn/scoreboard/game_date=/scoreboard.json.gz` | Games for an ET date | boxscores |
+| `raw/espn/summary/game_date=/event=<id>.json.gz` | Full game summary: box score, PBP, injuries | boxscores |
+
+Every file is `{"_meta": {source, params, fetched_at, ...}, "data": <untouched API response>}`.
+API keys are stripped from `_meta`.
+
+## Design notes
+
+- **ESPN, not stats.nba.com:** stats.nba.com and cdn.nba.com block cloud IPs.
+- **No Lambda dependencies:** stdlib + the runtime's boto3, so Terraform zips `src/` directly.
+- **Idempotent:** box-score ingestion skips games already stored and re-checks the last 3 days, so late finals and retries are safe.
+- **Credit guard:** the odds job stops (and alarms) before The Odds API free quota runs out.
+- **Secret handling:** the API key lives in an SSM SecureString created by hand, so it never appears in Terraform state or git.
+
+## Deploy
+
+Prereqs: AWS CLI signed in with profile `nba-lakehouse` (`aws login --profile nba-lakehouse`), Terraform ≥ 1.6, a free key from <https://the-odds-api.com>.
+
+```bash
+# 1. Store the odds key (once)
+aws ssm put-parameter --profile nba-lakehouse --region us-east-2 \
+  --name /nba-lakehouse/odds-api-key --type SecureString --value "<YOUR_KEY>"
+
+# 2. Provision
+cd infra/terraform
+cp terraform.tfvars.example terraform.tfvars   # set alert_email
+terraform init && terraform apply
+
+# 3. Confirm the SNS subscription email AWS sends you, then smoke-test:
+aws lambda invoke --profile nba-lakehouse --region us-east-2 \
+  --function-name nba-lakehouse-boxscores --payload '{"date":"2026-10-15"}' \
+  --cli-binary-format raw-in-base64-out /dev/stdout
+```
+
+## Historical backfill
+
+`src/ingest/backfill.py` pulls past lines from The Odds API's historical endpoints (paid plans):
+player-points props 1h before each tip since 2023-05-03, plus game moneylines since 2022-23.
+It writes into the same `raw/odds/` layout (`_meta.historical = true`), skips files already
+stored, and stops at a credit reserve. Roughly 11 credits per game day plus 10 per game.
+
+```bash
+cd src && AWS_PROFILE=nba-lakehouse uv run --python 3.12 --with boto3 --with 'botocore[crt]' \
+  python -m ingest.backfill --start 2022-10-18 --end 2026-06-30 --out s3://<bucket>
+```
+
+## Test
+
+```bash
+uv run --python 3.12 --with pytest pytest -q tests
+```
