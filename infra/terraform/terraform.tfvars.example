@@ -5,3 +5,7 @@ alert_email = "you@example.com"
 # region             = "us-east-2"
 # aws_profile        = "nba-lakehouse"
 # monthly_budget_usd = 5
+
+# Databricks push sync (see databricks_sync.tf)
+databricks_host      = "https://dbc-xxxx.cloud.databricks.com"
+databricks_client_id = "<service-principal-application-id>"

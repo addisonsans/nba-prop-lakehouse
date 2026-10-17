@@ -1,4 +1,5 @@
 # A missed odds snapshot is data we can never get back, so failures email us.
+# The Databricks sync alarms too: a failed copy leaves a hole in the Databricks mirror.
 
 resource "aws_sns_topic" "alerts" {
   name = "${var.project}-alerts"
@@ -11,7 +12,7 @@ resource "aws_sns_topic_subscription" "alerts_email" {
 }
 
 resource "aws_cloudwatch_metric_alarm" "ingest_errors" {
-  for_each = aws_lambda_function.ingest
+  for_each = merge(aws_lambda_function.ingest, { "databricks-sync" = aws_lambda_function.databricks_sync })
 
   alarm_name          = "${each.value.function_name}-errors"
   alarm_description   = "${each.value.function_name} failed. Check its CloudWatch logs."

@@ -35,6 +35,11 @@ API keys are stripped from `_meta`.
 - **No Lambda dependencies:** stdlib + the runtime's boto3, so Terraform zips `src/` directly.
 - **Idempotent:** box-score ingestion skips games already stored and re-checks the last 3 days, so late finals and retries are safe.
 - **Credit guard:** the odds job stops (and alarms) before The Odds API free quota runs out.
+- **Databricks gets data pushed, not pulled:** this AWS project's managed resource control policy denies S3/STS calls from
+  principals outside the organization, so Databricks can't read the bucket via a storage credential. Instead every new
+  object triggers `nba-lakehouse-databricks-sync`, which copies it to the Unity Catalog volume `/Volumes/nba/raw/landing`
+  (same paths as the bucket) through the Files API, signed in as a service principal with access to that volume only.
+  `python -m ingest.databricks_sync --bucket <bucket>` re-copies everything.
 - **Secret handling:** the API key lives in an SSM SecureString created by hand, so it never appears in Terraform state or git.
 
 ## Deploy

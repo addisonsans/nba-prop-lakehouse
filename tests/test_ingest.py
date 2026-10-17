@@ -8,7 +8,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ingest import backfill, boxscores, odds  # noqa: E402
+from ingest import backfill, boxscores, databricks_sync, odds  # noqa: E402
 from ingest.storage import Store  # noqa: E402
 
 
@@ -149,3 +149,35 @@ def test_backfill_calendar_helpers():
     tip = lambda h: datetime(2024, 1, 15, h, tzinfo=timezone.utc)
     assert backfill.h2h_times([tip(23), tip(23)]) == [tip(22)]
     assert backfill.h2h_times([tip(18), tip(21), tip(23)]) == [tip(17), tip(20)]
+
+
+def test_databricks_sync_uploads_each_new_object_to_same_path(monkeypatch):
+    calls = []
+    def fake_call(method, url, *, data=None, headers=None, **_):
+        calls.append((method, url, data, headers))
+        if url.endswith("/oidc/v1/token"):
+            return b'{"access_token": "TOKEN", "expires_in": 3600}'
+        return b""
+    class FakeS3:
+        def get_object(self, Bucket, Key):
+            return {"Body": type("B", (), {"read": lambda self: f"{Bucket}/{Key}".encode()})()}
+    import boto3
+    monkeypatch.setattr(boto3, "client", lambda name: FakeS3())
+    monkeypatch.setattr(databricks_sync, "_call", fake_call)
+    monkeypatch.setattr(databricks_sync, "_token", {})
+    monkeypatch.setenv("DATABRICKS_HOST", "https://dbc.example.com/")
+    monkeypatch.setenv("DATABRICKS_CLIENT_ID", "client")
+    monkeypatch.setenv("DATABRICKS_SECRET", "s3cret")
+    monkeypatch.setenv("VOLUME_PATH", "/Volumes/nba/raw/landing")
+    record = lambda key: {"s3": {"bucket": {"name": "lake"}, "object": {"key": key}}}
+
+    out = databricks_sync.handler({"Records": [record("raw/odds/snapshot_date%3D2026-10-16/a.json.gz"),
+                                               record("historical/nba_stats/teams/teams.parquet")]}, None)
+
+    assert out == {"copied": 2}
+    token_calls = [c for c in calls if c[1].endswith("/oidc/v1/token")]
+    puts = [c for c in calls if c[0] == "PUT"]
+    assert len(token_calls) == 1  # token reused across files
+    assert puts[0][1] == "https://dbc.example.com/api/2.0/fs/files/Volumes/nba/raw/landing/raw/odds/snapshot_date%3D2026-10-16/a.json.gz?overwrite=true"
+    assert puts[0][2] == b"lake/raw/odds/snapshot_date=2026-10-16/a.json.gz"
+    assert puts[1][3]["Authorization"] == "Bearer TOKEN"

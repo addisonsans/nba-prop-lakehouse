@@ -42,3 +42,25 @@ variable "boxscore_schedule" {
   type        = string
   default     = "cron(0 6 * * ? *)"
 }
+
+variable "databricks_host" {
+  description = "Databricks workspace URL, e.g. https://dbc-xxxx.cloud.databricks.com. Set in terraform.tfvars."
+  type        = string
+}
+
+variable "databricks_client_id" {
+  description = "Application id of the Databricks service principal that writes to the volume. Set in terraform.tfvars."
+  type        = string
+}
+
+variable "databricks_secret_param" {
+  description = "SSM SecureString holding the service principal's OAuth secret. Created by hand, never by Terraform."
+  type        = string
+  default     = "/nba-lakehouse/databricks-sync-secret"
+}
+
+variable "databricks_volume_path" {
+  description = "Unity Catalog volume that mirrors the bucket."
+  type        = string
+  default     = "/Volumes/nba/raw/landing"
+}
