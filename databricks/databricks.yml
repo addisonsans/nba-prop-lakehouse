@@ -1,0 +1,30 @@
+# Databricks Asset Bundle: the Databricks side of the lakehouse, defined as code.
+#   cd databricks && databricks bundle deploy      # create/update the job
+#   databricks bundle run bronze_ingest            # run it now
+bundle:
+  name: nba_lakehouse
+
+workspace:
+  profile: nba # ~/.databrickscfg profile (created by `databricks auth login --profile nba`)
+
+resources:
+  jobs:
+    bronze_ingest:
+      name: nba-lakehouse-bronze
+      description: Load new landing-volume files into nba.bronze (Auto Loader).
+      # 6:30am ET picks up the 6am box scores; 5:30pm ET picks up the 5pm odds snapshot.
+      schedule:
+        quartz_cron_expression: "0 30 6,17 * * ?"
+        timezone_id: America/New_York
+      email_notifications:
+        on_failure:
+          - ${workspace.current_user.userName}
+      max_concurrent_runs: 1
+      tasks:
+        - task_key: bronze
+          notebook_task:
+            notebook_path: ./notebooks/bronze.py
+
+targets:
+  free:
+    default: true

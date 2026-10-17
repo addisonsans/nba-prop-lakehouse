@@ -62,6 +62,16 @@ aws lambda invoke --profile nba-lakehouse --region us-east-2 \
   --cli-binary-format raw-in-base64-out /dev/stdout
 ```
 
+## Databricks
+
+`databricks/` is a Databricks Asset Bundle. Job `nba-lakehouse-bronze` (6:30am and 5:30pm ET) uses Auto Loader to
+load new landing-volume files into `nba.bronze` (one row per file, JSON kept as a string) and reloads the historical
+parquet tables.
+
+```bash
+cd databricks && databricks bundle deploy && databricks bundle run bronze_ingest
+```
+
 ## Historical backfill
 
 `src/ingest/backfill.py` pulls past lines from The Odds API's historical endpoints (paid plans):

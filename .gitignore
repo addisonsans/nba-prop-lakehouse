@@ -17,3 +17,4 @@ __pycache__/
 # Local data pulls
 data/
 .DS_Store
+.databricks/
