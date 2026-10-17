@@ -64,9 +64,15 @@ aws lambda invoke --profile nba-lakehouse --region us-east-2 \
 
 ## Databricks
 
-`databricks/` is a Databricks Asset Bundle. Job `nba-lakehouse-bronze` (6:30am and 5:30pm ET) uses Auto Loader to
-load new landing-volume files into `nba.bronze` (one row per file, JSON kept as a string) and reloads the historical
-parquet tables.
+`databricks/` is a Databricks Asset Bundle. Job `nba-lakehouse-bronze-silver` (6:30am and 5:30pm ET):
+
+- **bronze:** Auto Loader loads new landing-volume files into `nba.bronze` (one row per file, JSON kept as a string)
+  and reloads the historical parquet tables.
+- **silver:** rebuilds `nba.silver` from bronze: prop lines (one row per game × book × player × line, over/under side
+  by side), moneylines, ESPN games/box scores/injuries, the cleaned historical tables, and two crosswalks:
+  Odds API games → NBA.com `game_id`, and sportsbook player names → NBA.com `player_id`. Names are matched only
+  against the two teams in that game, strict rules before loose ones (`databricks/notebooks/name_match.py`,
+  tested in `tests/test_name_match.py`); 58,355 of 58,372 player-games match, the rest are ambiguous ("J. Green").
 
 ```bash
 cd databricks && databricks bundle deploy && databricks bundle run bronze_ingest

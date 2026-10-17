@@ -10,8 +10,8 @@ workspace:
 resources:
   jobs:
     bronze_ingest:
-      name: nba-lakehouse-bronze
-      description: Load new landing-volume files into nba.bronze (Auto Loader).
+      name: nba-lakehouse-bronze-silver
+      description: Load new landing-volume files into nba.bronze (Auto Loader), then rebuild nba.silver.
       # 6:30am ET picks up the 6am box scores; 5:30pm ET picks up the 5pm odds snapshot.
       schedule:
         quartz_cron_expression: "0 30 6,17 * * ?"
@@ -24,6 +24,11 @@ resources:
         - task_key: bronze
           notebook_task:
             notebook_path: ./notebooks/bronze.py
+        - task_key: silver
+          depends_on:
+            - task_key: bronze
+          notebook_task:
+            notebook_path: ./notebooks/silver.py
 
 targets:
   free:
