@@ -14,6 +14,8 @@
 # MAGIC | `games`, `team_games`, `player_games`, `player_seasons`, `teams`, `schedule_2026_27` | historical NBA.com tables, cleaned |
 # MAGIC | `odds_game_xref` | Odds API game ↔ NBA.com `game_id` |
 # MAGIC | `odds_player_xref` | Odds API player name in a game ↔ NBA.com `player_id` |
+# MAGIC | `espn_game_xref` | ESPN game ↔ NBA.com `game_id` |
+# MAGIC | `espn_player_xref` | ESPN player ↔ NBA.com `player_id` |
 # MAGIC
 # MAGIC Team names are mapped to NBA.com abbreviations everywhere, so every table joins on the same codes.
 
@@ -40,11 +42,14 @@ TEAM_BY_NAME = {
 ESPN_ABBR = {"GS": "GSW", "NO": "NOP", "NY": "NYK", "SA": "SAS", "UTAH": "UTA", "WSH": "WAS"}
 
 
+# element_at() reads a bare string as a literal key, not a column name, so always pass a Column.
 def team_from_name(col):
+    col = F.col(col) if isinstance(col, str) else col
     return F.element_at(F.create_map(*[F.lit(x) for kv in TEAM_BY_NAME.items() for x in kv]), col)
 
 
 def team_from_espn(col):
+    col = F.col(col) if isinstance(col, str) else col
     return F.coalesce(F.element_at(F.create_map(*[F.lit(x) for kv in ESPN_ABBR.items() for x in kv]), col), col)
 
 
@@ -196,12 +201,13 @@ players = (
 stat = F.when(F.size("a.stats") > 0, F.map_from_arrays("g.names", "a.stats"))
 
 
+# Some older ESPN box scores use "--" for an empty stat.
 def made(name):
-    return F.split(stat[name], "-")[0].cast("int")
+    return F.split(stat[name], "-")[0].try_cast("int")
 
 
 def attempted(name):
-    return F.split(stat[name], "-")[1].cast("int")
+    return F.split(stat[name], "-")[1].try_cast("int")
 
 
 espn_player_box = save(
@@ -211,14 +217,16 @@ espn_player_box = save(
         F.col("a.athlete.position.abbreviation").alias("position"),
         F.col("a.starter").alias("starter"), F.col("a.didNotPlay").alias("did_not_play"),
         F.when(F.col("a.didNotPlay"), F.col("a.reason")).alias("dnp_reason"), F.col("a.ejected").alias("ejected"),
-        stat["MIN"].cast("int").alias("min"), stat["PTS"].cast("int").alias("pts"),
+        stat["MIN"].try_cast("int").alias("min"), stat["PTS"].try_cast("int").alias("pts"),
         made("FG").alias("fgm"), attempted("FG").alias("fga"),
         made("3PT").alias("fg3m"), attempted("3PT").alias("fg3a"),
         made("FT").alias("ftm"), attempted("FT").alias("fta"),
-        stat["OREB"].cast("int").alias("oreb"), stat["DREB"].cast("int").alias("dreb"), stat["REB"].cast("int").alias("reb"),
-        stat["AST"].cast("int").alias("ast"), stat["STL"].cast("int").alias("stl"), stat["BLK"].cast("int").alias("blk"),
-        stat["TO"].cast("int").alias("tov"), stat["PF"].cast("int").alias("pf"), stat["+/-"].cast("int").alias("plus_minus"),
-    ),
+        stat["OREB"].try_cast("int").alias("oreb"), stat["DREB"].try_cast("int").alias("dreb"), stat["REB"].try_cast("int").alias("reb"),
+        stat["AST"].try_cast("int").alias("ast"), stat["STL"].try_cast("int").alias("stl"), stat["BLK"].try_cast("int").alias("blk"),
+        stat["TO"].try_cast("int").alias("tov"), stat["PF"].try_cast("int").alias("pf"), stat["+/-"].try_cast("int").alias("plus_minus"),
+    )
+    # ESPN lists one 2025-26 Bulls player with no athlete record at all (no id, no name).
+    .where("espn_player_id IS NOT NULL"),
     "espn_player_box",
 )
 
@@ -291,6 +299,9 @@ odds_game_xref = save(
 # MAGIC 5. **surname**: exactly one candidate's surname appears and a first-name initial agrees
 # MAGIC    ("Alfred Joel Horford Reynoso" → Al Horford)
 # MAGIC
+# MAGIC A name shared by two different candidates (Chris Johnson ×2 in 2012-13) is left unmatched as
+# MAGIC `ambiguous_same_name` rather than guessed.
+# MAGIC
 # MAGIC Rules 1-2 run against that game's box score, then the teams' season rosters (a player with a
 # MAGIC posted line who then sat out has no box-score row). Rules 3-5 run last, against both full
 # MAGIC rosters, so a loose rule can never pick a teammate when the right player simply sat out.
@@ -298,7 +309,7 @@ odds_game_xref = save(
 # COMMAND ----------
 
 
-from name_match import match_player, norm  # noqa: E402  (notebooks/name_match.py)
+from name_match import AMBIGUOUS, match_player, merge, name_index, norm  # noqa: E402  (notebooks/name_match.py)
 
 wanted = (
     odds_player_points.select("event_id", "player_name").distinct()
@@ -311,14 +322,14 @@ seasons = pg.join(odds_game_xref.select("game_id"), "game_id").select("season").
 season_roster = pg.join(seasons, "season").select("season", "team", "player_id", "player").distinct().toPandas()
 game_season = pg.select("game_id", "season").distinct().join(odds_game_xref.select("game_id"), "game_id").toPandas()
 
-box_by_game = {g: dict(zip(d.player.map(norm), d.player_id)) for g, d in box.groupby("game_id")}
-roster_by_team = {k: dict(zip(d.player.map(norm), d.player_id)) for k, d in season_roster.groupby(["season", "team"])}
+box_by_game = {g: name_index(zip(d.player, d.player_id)) for g, d in box.groupby("game_id")}
+roster_by_team = {k: name_index(zip(d.player, d.player_id)) for k, d in season_roster.groupby(["season", "team"])}
 season_of = dict(zip(game_season.game_id, game_season.season))
 
 rows = []
 for r in wanted.itertuples(index=False):
     season = season_of.get(r.game_id)
-    roster = {**roster_by_team.get((season, r.home_team), {}), **roster_by_team.get((season, r.away_team), {})}
+    roster = merge(roster_by_team.get((season, r.home_team), {}), roster_by_team.get((season, r.away_team), {}))
     box_players = box_by_game.get(r.game_id, {})
     pid, method = match_player(r.player_name, box_players, roster)
     rows.append((r.event_id, r.game_id, r.player_name, None if pid is None else int(pid), method))
@@ -328,6 +339,76 @@ xref = spark.createDataFrame(
     "event_id string, game_id string, player_name string, player_id long, match_method string",
 )
 odds_player_xref = save(xref, "odds_player_xref")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ESPN → NBA.com. NBA.com history ends with 2025-26; from 2026-27 box scores come from ESPN, so
+# MAGIC each ESPN player id needs its NBA.com id to keep one continuous history per player.
+# MAGIC
+# MAGIC Games where both sources overlap (2024-25 and 2025-26) are matched by date and teams. Within a
+# MAGIC game, a player's stat line (points, rebounds, assists, shots made/attempted, ...) is nearly a
+# MAGIC fingerprint: the same line on the same team in the same game is the same player, whatever the
+# MAGIC name says. Lines shared by two teammates (two 0-0-0 bench cameos) are skipped. An ESPN id takes
+# MAGIC the NBA.com id that most of its games agree on, provided ≥ 90% agree, both directions.
+# MAGIC ESPN players with no overlapping games (back from a long absence) fall back to an exact,
+# MAGIC unambiguous name match; true rookies have no NBA.com id and stay null.
+
+# COMMAND ----------
+
+espn_game_xref = save(
+    espn_games.alias("o").join(nba_games.alias("g"), (F.col("o.game_date") == F.col("g.game_date")) & same_teams)
+    .select("o.espn_game_id", "g.game_id", "o.game_date", "o.home_team", "o.away_team"),
+    "espn_game_xref",
+)
+
+LINE = ["pts", "reb", "oreb", "ast", "stl", "blk", "tov", "pf", "fgm", "fga", "fg3m", "fg3a", "ftm", "fta"]
+unique_line = lambda df: (
+    df.withColumn("n", F.count("*").over(Window.partitionBy("game_id", "team", *LINE))).where("n = 1").drop("n")
+)
+espn_lines = unique_line(
+    espn_player_box.where("NOT did_not_play AND pts IS NOT NULL").join(espn_game_xref.select("espn_game_id", "game_id"), "espn_game_id")
+    .select("game_id", "team", "espn_player_id", F.col("player").alias("espn_name"), *LINE)
+)
+nba_lines = unique_line(
+    spark.table(f"{S}.player_games").join(espn_game_xref.select("game_id"), "game_id")
+    .select("game_id", "team", "player_id", F.col("player").alias("nba_name"), *LINE)
+)
+votes = (
+    espn_lines.join(nba_lines, ["game_id", "team", *LINE])
+    .groupBy("espn_player_id", "player_id").agg(F.count("*").alias("games_matched"))
+)
+by_espn = Window.partitionBy("espn_player_id")
+by_nba = Window.partitionBy("player_id")
+stat_matches = (
+    votes.withColumn("espn_share", F.col("games_matched") / F.sum("games_matched").over(by_espn))
+    .withColumn("nba_share", F.col("games_matched") / F.sum("games_matched").over(by_nba))
+    .where("espn_share >= 0.9 AND nba_share >= 0.9")
+    .select("espn_player_id", "player_id", "games_matched", F.lit("stat_line").alias("match_method"))
+)
+
+espn_names = espn_player_box.groupBy("espn_player_id").agg(
+    F.max_by("player", "game_date").alias("espn_name"), F.max("game_date").alias("espn_last_game"))
+leftover = espn_names.join(stat_matches, "espn_player_id", "left_anti").toPandas()
+nba_index = name_index(spark.table(f"{S}.player_games").groupBy("player_id").agg(F.max_by("player", "game_date").alias("player"))
+                       .toPandas()[["player", "player_id"]].itertuples(index=False))
+name_rows = []
+for r in leftover.itertuples(index=False):
+    pid = nba_index.get(norm(r.espn_name)) if r.espn_name else None
+    method = "ambiguous_same_name" if pid == AMBIGUOUS else ("name_only" if pid is not None else None)
+    name_rows.append((r.espn_player_id, None if pid in (None, AMBIGUOUS) else int(pid), method))
+name_matches = spark.createDataFrame(
+    pd.DataFrame(name_rows, columns=["espn_player_id", "player_id", "match_method"]),
+    "espn_player_id string, player_id long, match_method string",
+)
+
+nba_names = spark.table(f"{S}.player_games").groupBy("player_id").agg(F.max_by("player", "game_date").alias("nba_name"))
+espn_player_xref = save(
+    stat_matches.unionByName(name_matches.withColumn("games_matched", F.lit(None).cast("long")))
+    .join(espn_names, "espn_player_id").join(nba_names, "player_id", "left")
+    .select("espn_player_id", "espn_name", "player_id", "nba_name", "match_method", "games_matched", "espn_last_game"),
+    "espn_player_xref",
+)
 
 # COMMAND ----------
 
@@ -346,7 +427,17 @@ checks = {
     "player-game names unmatched": odds_player_xref.where("player_id IS NULL").count(),
     "moneyline rows": odds_moneylines.count(),
     "ESPN player-game rows": espn_player_box.count(),
+    "ESPN games matched to NBA.com": espn_game_xref.count(),
+    "ESPN players": espn_player_xref.count(),
+    "ESPN players matched to NBA.com": espn_player_xref.where("player_id IS NOT NULL").count(),
+    "NBA.com ids claimed by 2+ ESPN ids (must be 0)": espn_player_xref.where("player_id IS NOT NULL")
+        .groupBy("player_id").count().where("count > 1").count(),
 }
 display(spark.createDataFrame([(k, int(v)) for k, v in checks.items()], "check string, value long"))
 display(odds_player_xref.groupBy("match_method").count().orderBy(F.desc("count")))
 display(odds_player_xref.where("player_id IS NULL").groupBy("player_name").count().orderBy(F.desc("count")).limit(50))
+display(espn_player_xref.groupBy("match_method").count().orderBy(F.desc("count")))
+# Stat-line matches whose names differ: worth a glance, but the stats decide.
+display(espn_player_xref.where(F.col("match_method") == "stat_line")
+        .where(F.lower(F.regexp_replace("espn_name", "[^A-Za-z]", "")) != F.lower(F.regexp_replace("nba_name", "[^A-Za-z]", ""))))
+display(espn_player_xref.where("player_id IS NULL OR match_method != 'stat_line'").orderBy(F.desc("espn_last_game")))

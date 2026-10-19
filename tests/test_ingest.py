@@ -42,7 +42,7 @@ def test_boxscores_writes_only_final_games_and_is_idempotent(tmp_path, monkeypat
     first = boxscores.ingest_date(store, date(2026, 4, 15), pause=0)
     second = boxscores.ingest_date(store, date(2026, 4, 15), pause=0)
 
-    assert first == {"date": "2026-04-15", "games": 2, "written": 1, "skipped_existing": 0, "not_final": 1}
+    assert first == {"date": "2026-04-15", "games": 2, "written": 1, "skipped_existing": 0, "not_final": 1, "missing": 0}
     assert second["written"] == 0 and second["skipped_existing"] == 1
     saved = read(tmp_path / "raw/espn/summary/game_date=2026-04-15/event=1.json.gz")
     assert saved["data"] == {"boxscore": {}} and saved["_meta"]["params"] == {"event": "1"}

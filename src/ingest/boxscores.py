@@ -4,6 +4,10 @@ ESPN's public site API is used because stats.nba.com / cdn.nba.com block
 cloud IPs. Each summary holds both teams' player box scores plus the injury
 report, play-by-play and the ESPN consensus line, stored untouched.
 
+Backfill past seasons locally (free, no API key):
+  uv run --python 3.12 --with boto3 python -m ingest.boxscores \
+      --start 2024-10-22 --end 2026-06-30 --out s3://<bucket>
+
 Lambda event (all optional):
   {"date": "2026-04-15"}          # ingest one ET game date
   {"lookback_days": 3}            # default: the last N ET dates (yesterday first)
@@ -15,6 +19,7 @@ S3 layout:
 
 from __future__ import annotations
 
+import argparse
 import logging
 import os
 import time
@@ -42,7 +47,7 @@ def ingest_date(store: Store, game_date: date, *, pause: float = 0.5) -> dict:
         envelope(scoreboard, source=f"{ESPN_BASE}/scoreboard", params=params),
     )
 
-    stats = {"date": str(game_date), "games": 0, "written": 0, "skipped_existing": 0, "not_final": 0}
+    stats = {"date": str(game_date), "games": 0, "written": 0, "skipped_existing": 0, "not_final": 0, "missing": 0}
     for event in scoreboard.get("events", []):
         stats["games"] += 1
         if not event.get("status", {}).get("type", {}).get("completed"):
@@ -53,7 +58,15 @@ def ingest_date(store: Store, game_date: date, *, pause: float = 0.5) -> dict:
             stats["skipped_existing"] += 1
             continue
         summary_params = {"event": event["id"]}
-        summary, _ = http.get_json(f"{ESPN_BASE}/summary", summary_params)
+        try:
+            summary, _ = http.get_json(f"{ESPN_BASE}/summary", summary_params)
+        except http.HTTPStatusError as exc:
+            if exc.status != 404:
+                raise
+            # ESPN occasionally lists a final game whose summary it no longer serves.
+            log.warning("no ESPN summary for event %s on %s", event["id"], game_date)
+            stats["missing"] += 1
+            continue
         store.put_json(key, envelope(summary, source=f"{ESPN_BASE}/summary", params=summary_params))
         stats["written"] += 1
         time.sleep(pause)
@@ -77,3 +90,29 @@ def handler(event, context):
     for r in results:
         log.info("boxscores %s", r)
     return {"results": results}
+
+
+def main(argv: list[str] | None = None) -> None:
+    p = argparse.ArgumentParser(description="Backfill ESPN game summaries for a date range.")
+    p.add_argument("--start", type=date.fromisoformat, required=True)
+    p.add_argument("--end", type=date.fromisoformat, required=True)
+    p.add_argument("--out", default=os.environ.get("OUTPUT_URI"), required="OUTPUT_URI" not in os.environ)
+    args = p.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+
+    store, d = Store(args.out), args.start
+    totals = {"days": 0, "games": 0, "written": 0, "skipped_existing": 0, "not_final": 0, "missing": 0}
+    while d <= args.end:
+        if d.month not in (7, 8, 9):  # offseason
+            stats = ingest_date(store, d)
+            totals["days"] += 1
+            for k in ("games", "written", "skipped_existing", "not_final", "missing"):
+                totals[k] += stats[k]
+            if stats["games"]:
+                log.info("%s", stats)
+        d += timedelta(days=1)
+    log.info("done %s", totals)
+
+
+if __name__ == "__main__":
+    main()

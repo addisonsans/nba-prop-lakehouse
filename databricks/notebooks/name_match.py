@@ -40,6 +40,33 @@ def norm(name: str) -> str:
     return ALIASES.get(n, n)
 
 
+# Stands in for the player_id when two different players share a normalized name
+# (Chris Johnson x2 in 2012-13, Tony Mitchell x2 in 2013-14).
+AMBIGUOUS = -1
+
+
+def name_index(pairs) -> dict[str, int]:
+    """(name, player_id) pairs -> normalized name -> player_id, or AMBIGUOUS when a name is shared.
+
+    A plain dict(zip(...)) would silently keep whichever same-name player came last.
+    """
+    index: dict[str, int] = {}
+    for name, pid in pairs:
+        if not name:
+            continue
+        key = norm(name)
+        index[key] = pid if index.get(key, pid) == pid else AMBIGUOUS
+    return index
+
+
+def merge(*indexes: dict[str, int]) -> dict[str, int]:
+    merged: dict[str, int] = {}
+    for index in indexes:
+        for key, pid in index.items():
+            merged[key] = pid if merged.get(key, pid) == pid else AMBIGUOUS
+    return merged
+
+
 def strict_match(target: str, candidates: dict[str, int]) -> tuple[int | None, str | None]:
     """candidates: normalized name -> player_id."""
     if target in candidates:
@@ -93,5 +120,7 @@ def match_player(name: str, box: dict[str, int], roster: dict[str, int]) -> tupl
         pid, method = strict_match(target, roster)
         method = method and f"{method}_season_roster"
     if pid is None:
-        pid, method = loose_match(target, {**roster, **box})
+        pid, method = loose_match(target, merge(roster, box))
+    if pid == AMBIGUOUS:
+        return None, "ambiguous_same_name"
     return pid, method

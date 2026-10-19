@@ -5,17 +5,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "databricks" / "notebooks"))
 
-from name_match import match_player, norm  # noqa: E402
-
-
-def ids(names, offset=0):
-    return {norm(n): offset + i for i, n in enumerate(names)}
+from name_match import match_player, merge, name_index, norm  # noqa: E402
 
 
 def resolve(name, box, roster):
-    box_ids, roster_ids = ids(box), ids(roster, offset=100)
-    by_id = {**{v: k for k, v in roster_ids.items()}, **{v: k for k, v in box_ids.items()}}
-    pid, method = match_player(name, box_ids, roster_ids)
+    # One id per distinct player, shared by the box score and the roster, as in the real tables.
+    pid_of = {n: i for i, n in enumerate(dict.fromkeys(map(norm, roster + box)))}
+    by_id = {i: n for n, i in pid_of.items()}
+    pid, method = match_player(name, {norm(n): pid_of[norm(n)] for n in box}, {norm(n): pid_of[norm(n)] for n in roster})
     return by_id.get(pid), method
 
 
@@ -48,6 +45,17 @@ HOU = ["Jalen Green", "Fred VanVleet", "Alperen Sengun", "Jeff Green", "Dillon B
 ])
 def test_match_player(name, box, roster, expected):
     assert resolve(name, box, roster)[0] == expected
+
+
+def test_same_name_players_are_never_guessed():
+    home = name_index([("Chris Johnson", 1), ("Kevin Love", 2)])
+    away = name_index([("Chris Johnson", 3), ("Paul Pierce", 4)])
+    # Two Chris Johnsons on opposite rosters, neither in the box score.
+    assert match_player("Chris Johnson", {}, merge(home, away)) == (None, "ambiguous_same_name")
+    # Only one of them played, so the box score settles it.
+    assert match_player("Chris Johnson", name_index([("Chris Johnson", 3)]), merge(home, away)) == (3, "exact")
+    # Same player listed twice (e.g. traded mid-season) is not a conflict.
+    assert name_index([("Chris Johnson", 1), ("Chris Johnson Jr.", 1)]) == {"chris johnson": 1}
 
 
 def test_norm_strips_accents_suffixes_and_punctuation():

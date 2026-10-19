@@ -69,10 +69,16 @@ aws lambda invoke --profile nba-lakehouse --region us-east-2 \
 - **bronze:** Auto Loader loads new landing-volume files into `nba.bronze` (one row per file, JSON kept as a string)
   and reloads the historical parquet tables.
 - **silver:** rebuilds `nba.silver` from bronze: prop lines (one row per game × book × player × line, over/under side
-  by side), moneylines, ESPN games/box scores/injuries, the cleaned historical tables, and two crosswalks:
-  Odds API games → NBA.com `game_id`, and sportsbook player names → NBA.com `player_id`. Names are matched only
-  against the two teams in that game, strict rules before loose ones (`databricks/notebooks/name_match.py`,
-  tested in `tests/test_name_match.py`); 58,355 of 58,372 player-games match, the rest are ambiguous ("J. Green").
+  by side), moneylines, ESPN games/box scores/injuries, the cleaned historical tables, and crosswalks:
+  - Odds API games → NBA.com `game_id`, and sportsbook player names → NBA.com `player_id`. Names are matched only
+    against the two teams in that game, strict rules before loose ones (`databricks/notebooks/name_match.py`,
+    tested in `tests/test_name_match.py`); 58,355 of 58,372 player-games match, the rest are ambiguous ("J. Green").
+    A name shared by two different players (Chris Johnson ×2 in 2012-13) is left unmatched, never guessed.
+  - ESPN player ids → NBA.com `player_id`, so a player's history continues past 2025-26 (NBA.com data ends there,
+    ESPN feeds the live seasons). In the 2,637 games both sources cover, an identical stat line on the same team
+    in the same game identifies the player regardless of spelling; an id takes the match ≥ 90% of its games agree
+    on, in both directions (687 players, median 84 games each). Players with no shared games fall back to an
+    exact, unambiguous name; rookies stay null.
 
 ```bash
 cd databricks && databricks bundle deploy && databricks bundle run bronze_ingest
@@ -88,6 +94,13 @@ stored, and stops at a credit reserve. Roughly 11 credits per game day plus 10 p
 ```bash
 cd src && AWS_PROFILE=nba-lakehouse uv run --python 3.12 --with boto3 --with 'botocore[crt]' \
   python -m ingest.backfill --start 2022-10-18 --end 2026-06-30 --out s3://<bucket>
+```
+
+ESPN box scores for past seasons (free) use the same layout as the daily job:
+
+```bash
+cd src && AWS_PROFILE=nba-lakehouse uv run --python 3.12 --with boto3 --with 'botocore[crt]' \
+  python -m ingest.boxscores --start 2024-10-22 --end 2026-06-30 --out s3://<bucket>
 ```
 
 ## Test
