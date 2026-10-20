@@ -33,6 +33,10 @@ def implied(price):
     return F.when(price > 0, 100 / (price + 100)).otherwise(-price / (-price + 100))
 
 
+def to_decimal(price):
+    return F.when(price > 0, 1 + price / 100).otherwise(1 + 100 / F.abs(price))
+
+
 def season_of(date_col):
     y = F.when(F.month(date_col) >= 8, F.year(date_col)).otherwise(F.year(date_col) - 1)
     return F.concat(y.cast("string"), F.lit("-"), F.lpad(((y + 1) % 100).cast("string"), 2, "0"))
@@ -75,10 +79,12 @@ prop_lines = save(
 )
 
 # Consensus per player-game: the line most books post (ties -> the lower line), the average no-vig
-# probability among books at that line, and the best price on each side there.
+# probability among books at that line, and the best and the typical (median) price on each side there.
 by_line = prop_lines.groupBy("event_id", "game_id", "player_key", "line").agg(
     F.count("*").alias("books_at_line"), F.avg("p_over_novig").alias("market_p_over"),
     F.max("over_price").alias("best_over_price"), F.max("under_price").alias("best_under_price"),
+    F.percentile(to_decimal(F.col("over_price")), 0.5).alias("median_over_decimal"),
+    F.percentile(to_decimal(F.col("under_price")), 0.5).alias("median_under_decimal"),
 )
 modal = Window.partitionBy("event_id", "player_key").orderBy(F.desc("books_at_line"), "line")
 consensus = (
@@ -130,6 +136,47 @@ this_season = Window.partitionBy("player_key", "season").orderBy(*order).rowsBet
 usage = F.col("fga") + 0.44 * F.col("fta") + F.col("tov")
 team_usage = F.col("team_fga") + 0.44 * F.col("team_fta") + F.col("team_tov")
 
+# Teammates out: rotation players (≥ 15 min/game over their last 10) who played for the team within
+# the last 15 days but are missing tonight. For a played game, missing = not in the box score; for a
+# game not played yet, missing = listed Out on the latest ESPN injury report.
+played_only = timeline.where("game_id IS NOT NULL")
+career_played = Window.partitionBy("player_key").orderBy(*order)
+upto10 = career_played.rowsBetween(-9, 0)
+form = played_only.select(
+    "player_key", "team", "game_date",
+    F.avg("min").over(upto10).alias("min_form"), F.avg("pts").over(upto10).alias("pts_form"),
+    F.try_divide(F.sum(usage).over(upto10), F.sum(team_usage).over(upto10)).alias("usage_form"),
+    F.lead("game_date").over(career_played).alias("next_game_date"),
+).where("min_form >= 15")
+slots = timeline.select("row_id", "team", "game_date", "event_id", "game_id").distinct().alias("s")
+candidates = slots.join(
+    form.alias("f"),
+    (F.col("f.team") == F.col("s.team")) & (F.col("f.game_date") < F.col("s.game_date"))
+    & (F.col("f.game_date") >= F.date_sub(F.col("s.game_date"), 15))
+    & (F.col("f.next_game_date").isNull() | (F.col("f.next_game_date") >= F.col("s.game_date"))),
+).select("s.row_id", "s.team", "s.game_id", F.col("f.player_key").alias("out_key"), "f.usage_form", "f.pts_form")
+injury_key = F.coalesce(F.col("player_id").cast("string"), F.concat(F.lit("espn:"), F.col("espn_player_id")))
+listed_out = (
+    spark.table(f"{S}.espn_injuries").where(F.col("snapshot_at") == spark.table(f"{S}.espn_injuries").agg(F.max("snapshot_at")).first()[0])
+    .where("status = 'Out'")
+    .join(spark.table(f"{S}.espn_player_xref").select("espn_player_id", "player_id"), "espn_player_id", "left")
+    .select(injury_key.alias("out_key")).distinct()
+)
+absent = (
+    candidates.where("game_id IS NOT NULL")
+    .join(played_only.select("row_id", F.col("player_key").alias("out_key")), ["row_id", "out_key"], "left_anti")
+    .unionByName(candidates.where("game_id IS NULL").join(listed_out, "out_key"))
+)
+teammates_out = (
+    timeline.select("row_id", "team", "player_key").join(absent, ["row_id", "team"])
+    .where("out_key != player_key")
+    .groupBy("row_id", "player_key").agg(
+        F.count("*").alias("teammates_out_n"), F.sum("usage_form").alias("teammates_out_usage"),
+        F.sum("pts_form").alias("teammates_out_pts"),
+    )
+)
+OUT_COLS = ["teammates_out_n", "teammates_out_usage", "teammates_out_pts"]
+
 prev_season = (
     played.groupBy("player_key", "season").agg(F.avg("pts").alias("pts_prev_season"), F.avg("min").alias("min_prev_season"),
                                                 F.count("*").alias("games_prev_season"))
@@ -153,7 +200,8 @@ player_features = save(
         F.datediff("game_date", F.lag("game_date").over(career)).alias("days_rest"),
         "season_end",
     )
-    .join(prev_season, ["player_key", "season_end"], "left").drop("season_end"),
+    .join(prev_season, ["player_key", "season_end"], "left").drop("season_end")
+    .join(teammates_out, ["row_id", "player_key"], "left").fillna(0, subset=OUT_COLS),
     "player_features",
 )
 
@@ -225,7 +273,8 @@ props = (
     .select(
         "event_id", "game_id", "player_key", "player_name", season_of(F.col("game_date")).alias("season"),
         "season_type", "game_date", "commence_time", "home_team", "away_team", "team", "opp", "is_home",
-        "line", "market_p_over", "best_over_price", "best_under_price", "n_books", "books_at_line", "line_min", "line_max",
+        "line", "market_p_over", "best_over_price", "best_under_price", "median_over_decimal", "median_under_decimal",
+        "n_books", "books_at_line", "line_min", "line_max",
         "last_snapshot_at",
         team_spread.alias("team_spread"), total.alias("game_total"), (total / 2 - team_spread / 2).alias("team_implied_total"),
         *FEATURES,

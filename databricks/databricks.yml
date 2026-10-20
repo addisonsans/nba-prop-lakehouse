@@ -35,6 +35,25 @@ resources:
           notebook_task:
             notebook_path: ./notebooks/gold.py
 
+    model_backtest:
+      name: nba-lakehouse-model-backtest
+      description: Walk-forward backtest of the points model against real prop lines (run on demand).
+      email_notifications:
+        on_failure:
+          - ${workspace.current_user.userName}
+      tasks:
+        - task_key: backtest
+          notebook_task:
+            notebook_path: ./notebooks/model_backtest.py
+
+    model_backtest:
+      name: nba-points-model-backtest
+      description: Walk-forward backtest of the points model against real prop lines (run on demand).
+      tasks:
+        - task_key: backtest
+          notebook_task:
+            notebook_path: ./notebooks/model_backtest.py
+
 targets:
   free:
     default: true
