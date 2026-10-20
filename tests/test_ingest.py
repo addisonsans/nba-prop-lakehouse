@@ -64,14 +64,15 @@ def _odds_fake(remaining_after_each):
 
 
 def test_odds_snapshot_writes_each_event_and_strips_api_key(tmp_path, monkeypatch):
-    monkeypatch.setattr(odds.http, "get_json", _odds_fake([99, 98, 97]))
+    monkeypatch.setattr(odds.http, "get_json", _odds_fake([99, 98, 97, 94]))
     now = datetime(2026, 11, 2, 21, 0, tzinfo=timezone.utc)
 
     stats = odds.snapshot(Store(str(tmp_path)), "SECRET", now)
 
-    assert stats["written"] == 3 and stats["credits_remaining"] == 97
+    assert stats["written"] == 3 and stats["credits_remaining"] == 94
     files = list(tmp_path.rglob("*.json.gz"))
-    assert len(files) == 4  # events listing + 3 events
+    assert len(files) == 5  # events listing + 3 events + game lines
+    assert len(list(tmp_path.rglob("game_lines.json.gz"))) == 1
     assert all("SECRET" not in gzip.decompress(f.read_bytes()).decode() for f in files)
 
 

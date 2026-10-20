@@ -7,7 +7,7 @@ player-points distributions.
 
 ```
 EventBridge Scheduler (ET)
- ├─ 5:00pm ─> Lambda nba-lakehouse-odds      ─> The Odds API (player_points) + ESPN injuries ─┐
+ ├─ 5:00pm ─> Lambda nba-lakehouse-odds      ─> The Odds API (props + game lines) + ESPN injuries ─┐
  └─ 6:00am ─> Lambda nba-lakehouse-boxscores ─> ESPN scoreboard + game summaries ─────────────┤
                                                                                               v
                                                       S3  raw/  (gzipped JSON, Hive-style partitions)
@@ -80,8 +80,18 @@ aws lambda invoke --profile nba-lakehouse --region us-east-2 \
     on, in both directions (687 players, median 84 games each). Players with no shared games fall back to an
     exact, unambiguous name; rookies stay null.
 
+  - One timeline (`all_games`, `all_player_games`, `all_team_games`): NBA.com through 2025-26, ESPN games after,
+    players keyed by `player_key` (NBA.com id, or `espn:<id>` for rookies). Odds games and names are matched
+    against it, including tonight's games before they're played.
+- **gold:** `props`, one row per player per game with a line: the consensus line (the one most books post),
+  the market's no-vig over probability, best prices, game spread/total, features computed only from earlier
+  games (recent and season scoring, minutes, shot volume, usage share, rest, team pace, opponent defensive
+  rating), and once played the points and result (over/under/push; a player who sits out is a void bet).
+  Tonight's props sit in the same table with no result, so the model scores them the way it was backtested.
+  54,632 graded props from May 2023 to June 2026.
+
 ```bash
-cd databricks && databricks bundle deploy && databricks bundle run bronze_ingest
+cd databricks && databricks bundle deploy && databricks bundle run bronze_ingest   # bronze -> silver -> gold
 ```
 
 ## Historical backfill

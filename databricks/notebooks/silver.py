@@ -10,12 +10,15 @@
 # MAGIC | `odds_events` | Odds API game |
 # MAGIC | `odds_player_points` | game × snapshot × sportsbook × player × line, over/under prices side by side |
 # MAGIC | `odds_moneylines` | game × snapshot × sportsbook |
+# MAGIC | `odds_game_lines` | game × snapshot × sportsbook: spread and total (live snapshots, 2026-27 on) |
 # MAGIC | `espn_games`, `espn_player_box`, `espn_injuries` | ESPN game / player-game / injury-report entry |
 # MAGIC | `games`, `team_games`, `player_games`, `player_seasons`, `teams`, `schedule_2026_27` | historical NBA.com tables, cleaned |
-# MAGIC | `odds_game_xref` | Odds API game ↔ NBA.com `game_id` |
-# MAGIC | `odds_player_xref` | Odds API player name in a game ↔ NBA.com `player_id` |
+# MAGIC | `odds_game_xref` | Odds API game ↔ `all_games.game_id` |
+# MAGIC | `odds_player_xref` | Odds API player name in a game ↔ `player_key` (played and upcoming games) |
 # MAGIC | `espn_game_xref` | ESPN game ↔ NBA.com `game_id` |
 # MAGIC | `espn_player_xref` | ESPN player ↔ NBA.com `player_id` |
+# MAGIC | `all_games`, `all_player_games`, `all_team_games` | one timeline: NBA.com through 2025-26, ESPN after |
+# MAGIC | `player_latest_team` | player's team as of their latest game (preseason included) |
 # MAGIC
 # MAGIC Team names are mapped to NBA.com abbreviations everywhere, so every table joins on the same codes.
 
@@ -130,28 +133,40 @@ odds_player_points = save(
     "odds_player_points",
 )
 
-# Moneylines: the h2h files hold every game on the slate.
-h2h = (
-    odds.where("file_kind = 'h2h'")
+# Slate-wide files: backfill `h2h` (moneylines) and live `game_lines` (moneylines, spreads, totals).
+slate = (
+    odds.where("file_kind IN ('h2h', 'game_lines')")
     .select(F.from_json("raw_json", f"struct<_meta:{META}, data:array<{EVENT}>>").alias("j"), "snapshot_ts")
     .select(F.explode("j.data").alias("ev"), "j._meta", "snapshot_ts")
     .select(*game_cols(F.col("ev")), *snapshot_cols(F.col("_meta")), F.col("ev.home_team").alias("home_name"),
             F.col("ev.away_team").alias("away_name"), F.explode("ev.bookmakers").alias("b"))
     .select("*", F.explode("b.markets").alias("m"))
     .select("*", F.explode("m.outcomes").alias("o"))
-)
-odds_moneylines = save(
-    h2h.groupBy(
-        "event_id", "commence_time", "game_date", "home_team", "away_team",
-        "snapshot_requested_at", "snapshot_at", "is_historical", F.col("b.key").alias("bookmaker"),
-    ).agg(
-        F.max(F.when(F.col("o.name") == F.col("home_name"), F.col("o.price"))).alias("home_price"),
-        F.max(F.when(F.col("o.name") == F.col("away_name"), F.col("o.price"))).alias("away_price"),
-        F.max(F.to_timestamp("m.last_update")).alias("book_updated_at"),
-    )
     # A slate snapshot taken after a game tipped off has in-game prices; keep pre-game only.
-    .where("snapshot_at < commence_time"),
+    .where("snapshot_at < commence_time")
+)
+slate_keys = ["event_id", "commence_time", "game_date", "home_team", "away_team",
+              "snapshot_requested_at", "snapshot_at", "is_historical", F.col("b.key").alias("bookmaker")]
+is_home, is_away = F.col("o.name") == F.col("home_name"), F.col("o.name") == F.col("away_name")
+market = lambda key: F.col("m.key") == key
+odds_moneylines = save(
+    slate.where(market("h2h")).groupBy(*slate_keys).agg(
+        F.max(F.when(is_home, F.col("o.price"))).alias("home_price"),
+        F.max(F.when(is_away, F.col("o.price"))).alias("away_price"),
+        F.max(F.to_timestamp("m.last_update")).alias("book_updated_at"),
+    ),
     "odds_moneylines",
+)
+odds_game_lines = save(
+    slate.where(market("spreads") | market("totals")).groupBy(*slate_keys).agg(
+        F.max(F.when(market("spreads") & is_home, F.col("o.point"))).alias("home_spread"),
+        F.max(F.when(market("spreads") & is_home, F.col("o.price"))).alias("home_spread_price"),
+        F.max(F.when(market("spreads") & is_away, F.col("o.price"))).alias("away_spread_price"),
+        F.max(F.when(market("totals") & (F.col("o.name") == "Over"), F.col("o.point"))).alias("total"),
+        F.max(F.when(market("totals") & (F.col("o.name") == "Over"), F.col("o.price"))).alias("over_price"),
+        F.max(F.when(market("totals") & (F.col("o.name") == "Under"), F.col("o.price"))).alias("under_price"),
+    ),
+    "odds_game_lines",
 )
 
 unmapped = odds_events.where("home_team IS NULL OR away_team IS NULL").count()
@@ -264,85 +279,7 @@ for name in ["games", "team_games", "player_games", "player_seasons", "teams", "
 
 # MAGIC %md
 # MAGIC ## Crosswalks
-# MAGIC Odds API games → NBA.com games by date and teams. Neutral-site games can list home/away
-# MAGIC differently between sources, so the team pair is matched in either order.
-
-# COMMAND ----------
-
-nba_games = spark.table(f"{S}.games").select("game_id", "game_date", "home_team", "away_team")
-pair = lambda h, a: F.array_sort(F.array(h, a))
-same_teams = pair(F.col("o.home_team"), F.col("o.away_team")) == pair(F.col("g.home_team"), F.col("g.away_team"))
-cols = ["o.event_id", "g.game_id", "o.game_date", "o.home_team", "o.away_team"]
-same_day = odds_events.alias("o").join(nba_games.alias("g"), (F.col("o.game_date") == F.col("g.game_date")) & same_teams)
-# Postponed games and playoff/play-in games listed before the schedule was final can be off by a
-# day or two; accept those only when exactly one game between the two teams is that close.
-near = (
-    odds_events.join(same_day.select("o.event_id"), "event_id", "left_anti").alias("o")
-    .join(nba_games.alias("g"), (F.abs(F.datediff("o.game_date", "g.game_date")) <= 2) & same_teams)
-    .withColumn("n", F.count("*").over(Window.partitionBy("o.event_id"))).where("n = 1")
-)
-odds_game_xref = save(
-    same_day.select(*cols, F.lit("same_day").alias("match_method"))
-    .unionByName(near.select(*cols, F.lit("within_2_days").alias("match_method"))),
-    "odds_game_xref",
-)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC Odds API player names → NBA.com `player_id`. Each name is matched only against players on the
-# MAGIC two teams in that game, which keeps same-name players apart. Rules, in order:
-# MAGIC 1. **exact** after normalizing (accents, punctuation, Jr./III suffixes)
-# MAGIC 2. **nickname**: same last name and one first name starts with the other (Nic/Nicolas, Herb/Herbert)
-# MAGIC 3. **all_words**: every word of exactly one NBA.com name appears ("Wembanyama Victor", "Brook Robert Lopez")
-# MAGIC 4. **fuzzy**: closest name by similarity ≥ 0.85, only if no other candidate is close
-# MAGIC 5. **surname**: exactly one candidate's surname appears and a first-name initial agrees
-# MAGIC    ("Alfred Joel Horford Reynoso" → Al Horford)
-# MAGIC
-# MAGIC A name shared by two different candidates (Chris Johnson ×2 in 2012-13) is left unmatched as
-# MAGIC `ambiguous_same_name` rather than guessed.
-# MAGIC
-# MAGIC Rules 1-2 run against that game's box score, then the teams' season rosters (a player with a
-# MAGIC posted line who then sat out has no box-score row). Rules 3-5 run last, against both full
-# MAGIC rosters, so a loose rule can never pick a teammate when the right player simply sat out.
-
-# COMMAND ----------
-
-
-from name_match import AMBIGUOUS, match_player, merge, name_index, norm  # noqa: E402  (notebooks/name_match.py)
-
-wanted = (
-    odds_player_points.select("event_id", "player_name").distinct()
-    .join(odds_game_xref.select("event_id", "game_id", "home_team", "away_team"), "event_id")
-    .toPandas()
-)
-pg = spark.table(f"{S}.player_games").select("game_id", "season", "team", "player_id", "player")
-box = pg.join(odds_game_xref.select("game_id"), "game_id").toPandas()
-seasons = pg.join(odds_game_xref.select("game_id"), "game_id").select("season").distinct()
-season_roster = pg.join(seasons, "season").select("season", "team", "player_id", "player").distinct().toPandas()
-game_season = pg.select("game_id", "season").distinct().join(odds_game_xref.select("game_id"), "game_id").toPandas()
-
-box_by_game = {g: name_index(zip(d.player, d.player_id)) for g, d in box.groupby("game_id")}
-roster_by_team = {k: name_index(zip(d.player, d.player_id)) for k, d in season_roster.groupby(["season", "team"])}
-season_of = dict(zip(game_season.game_id, game_season.season))
-
-rows = []
-for r in wanted.itertuples(index=False):
-    season = season_of.get(r.game_id)
-    roster = merge(roster_by_team.get((season, r.home_team), {}), roster_by_team.get((season, r.away_team), {}))
-    box_players = box_by_game.get(r.game_id, {})
-    pid, method = match_player(r.player_name, box_players, roster)
-    rows.append((r.event_id, r.game_id, r.player_name, None if pid is None else int(pid), method))
-
-xref = spark.createDataFrame(
-    pd.DataFrame(rows, columns=["event_id", "game_id", "player_name", "player_id", "match_method"]),
-    "event_id string, game_id string, player_name string, player_id long, match_method string",
-)
-odds_player_xref = save(xref, "odds_player_xref")
-
-# COMMAND ----------
-
-# MAGIC %md
+# MAGIC ### ESPN → NBA.com
 # MAGIC ESPN → NBA.com. NBA.com history ends with 2025-26; from 2026-27 box scores come from ESPN, so
 # MAGIC each ESPN player id needs its NBA.com id to keep one continuous history per player.
 # MAGIC
@@ -355,6 +292,13 @@ odds_player_xref = save(xref, "odds_player_xref")
 # MAGIC unambiguous name match; true rookies have no NBA.com id and stay null.
 
 # COMMAND ----------
+
+from name_match import AMBIGUOUS, match_player, merge, name_index, norm  # noqa: E402  (notebooks/name_match.py)
+
+nba_games = spark.table(f"{S}.games").select("game_id", "game_date", "home_team", "away_team")
+# Neutral-site games can list home/away differently between sources: match the team pair in either order.
+pair = lambda h, a: F.array_sort(F.array(h, a))
+same_teams = pair(F.col("o.home_team"), F.col("o.away_team")) == pair(F.col("g.home_team"), F.col("g.away_team"))
 
 espn_game_xref = save(
     espn_games.alias("o").join(nba_games.alias("g"), (F.col("o.game_date") == F.col("g.game_date")) & same_teams)
@@ -412,21 +356,196 @@ espn_player_xref = save(
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ## One timeline
+# MAGIC `all_games`, `all_player_games` and `all_team_games` hold NBA.com games through 2025-26, then ESPN
+# MAGIC games NBA.com doesn't have (2026-27 on), in one shape. Players are keyed by `player_key`: the
+# MAGIC NBA.com id when known, else `espn:<id>` (rookies). Preseason and exhibition (All-Star) games are left out.
+
+# COMMAND ----------
+
+NBA_TEAMS = sorted(set(TEAM_BY_NAME.values()))
+espn_only = (
+    espn_games.join(espn_game_xref.select("espn_game_id"), "espn_game_id", "left_anti")
+    .where(F.col("season_type").isin("regular", "playoffs", "playin"))
+    .where(F.col("home_team").isin(NBA_TEAMS) & F.col("away_team").isin(NBA_TEAMS))
+)
+season_label = lambda end: F.concat((end - 1).cast("string"), F.lit("-"), F.lpad((end % 100).cast("string"), 2, "0"))
+all_games = save(
+    spark.table(f"{S}.games").select(
+        "game_id", F.lit("nba").alias("source"), "season", "season_type", "game_date", "home_team", "away_team",
+        F.col("home_pts").cast("long").alias("home_pts"), F.col("away_pts").cast("long").alias("away_pts"),
+        "is_neutral", "home_spread_close", "total_close",
+    ).unionByName(espn_only.select(
+        F.col("espn_game_id").alias("game_id"), F.lit("espn").alias("source"), season_label(F.col("season_end")).alias("season"),
+        "season_type", "game_date", "home_team", "away_team",
+        F.col("home_pts").cast("long").alias("home_pts"), F.col("away_pts").cast("long").alias("away_pts"), "is_neutral",
+        # Closing lines come with the NBA.com history only; live seasons use odds_game_lines.
+        F.lit(None).cast("double").alias("home_spread_close"), F.lit(None).cast("double").alias("total_close"),
+    )),
+    "all_games",
+)
+
+STATS = ["min", "pts", "fgm", "fga", "fg3m", "fg3a", "ftm", "fta", "oreb", "dreb", "reb", "ast", "stl", "blk", "tov", "pf", "plus_minus"]
+key_of = espn_player_xref.select("espn_player_id", "player_id")
+player_key = F.coalesce(F.col("player_id").cast("string"), F.concat(F.lit("espn:"), F.col("espn_player_id")))
+nba_side = (
+    spark.table(f"{S}.player_games").join(key_of.where("player_id IS NOT NULL"), "player_id", "left")
+    .select("game_id", F.lit("nba").alias("source"), "season", "season_type", "game_date", player_key.alias("player_key"),
+            "player_id", "espn_player_id", "player", "team", "opp", "is_home", *[F.col(c).cast("long").alias(c) for c in STATS])
+)
+g = all_games.where("source = 'espn'")
+espn_side = (
+    espn_player_box.where("NOT did_not_play AND min IS NOT NULL").drop("game_date")
+    .join(g.withColumnRenamed("game_id", "espn_game_id"), "espn_game_id")
+    .join(key_of, "espn_player_id", "left")
+    .select(F.col("espn_game_id").alias("game_id"), F.lit("espn").alias("source"), "season", "season_type", "game_date",
+            player_key.alias("player_key"), "player_id", "espn_player_id", "player", "team",
+            F.when(F.col("team") == F.col("home_team"), F.col("away_team")).otherwise(F.col("home_team")).alias("opp"),
+            (F.col("team") == F.col("home_team")).alias("is_home"), *[F.col(c).cast("long").alias(c) for c in STATS])
+)
+all_player_games = save(nba_side.unionByName(espn_side), "all_player_games")
+
+TEAM_STATS = ["fgm", "fga", "fg3m", "fg3a", "ftm", "fta", "oreb", "dreb", "reb", "ast", "stl", "blk", "tov", "pf"]
+espn_team_games = (
+    espn_side.groupBy("game_id", "team").agg(*[F.sum(c).alias(c) for c in TEAM_STATS])
+    .join(g, "game_id")
+    .select("game_id", "source", "season", "season_type", "game_date", "team",
+            F.when(F.col("team") == F.col("home_team"), F.col("away_team")).otherwise(F.col("home_team")).alias("opp"),
+            (F.col("team") == F.col("home_team")).alias("is_home"),
+            F.when(F.col("team") == F.col("home_team"), F.col("home_pts")).otherwise(F.col("away_pts")).alias("pts"),
+            F.when(F.col("team") == F.col("home_team"), F.col("away_pts")).otherwise(F.col("home_pts")).alias("opp_pts"),
+            *TEAM_STATS)
+)
+all_team_games = save(
+    spark.table(f"{S}.team_games").select(
+        "game_id", F.lit("nba").alias("source"), "season", "season_type", "game_date", "team", "opp", "is_home",
+        *[F.col(c).cast("long").alias(c) for c in ["pts", "opp_pts", *TEAM_STATS]],
+    ).unionByName(espn_team_games.select(
+        "game_id", "source", "season", "season_type", "game_date", "team", "opp", "is_home",
+        *[F.col(c).cast("long").alias(c) for c in ["pts", "opp_pts", *TEAM_STATS]],
+    )),
+    "all_team_games",
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Odds API → the timeline
+# MAGIC Odds API games → `all_games` by date and teams. Games not played yet (tonight's slate) have no
+# MAGIC `game_id` but still get their player names matched.
+
+# COMMAND ----------
+
+timeline_games = all_games.select("game_id", "game_date", "home_team", "away_team")
+cols = ["o.event_id", "g.game_id", "o.game_date", "o.home_team", "o.away_team"]
+same_day = odds_events.alias("o").join(timeline_games.alias("g"), (F.col("o.game_date") == F.col("g.game_date")) & same_teams)
+# Postponed games and playoff/play-in games listed before the schedule was final can be off by a
+# day or two; accept those only when exactly one game between the two teams is that close.
+near = (
+    odds_events.join(same_day.select("o.event_id"), "event_id", "left_anti").alias("o")
+    .join(timeline_games.alias("g"), (F.abs(F.datediff("o.game_date", "g.game_date")) <= 2) & same_teams)
+    .withColumn("n", F.count("*").over(Window.partitionBy("o.event_id"))).where("n = 1")
+)
+odds_game_xref = save(
+    same_day.select(*cols, F.lit("same_day").alias("match_method"))
+    .unionByName(near.select(*cols, F.lit("within_2_days").alias("match_method"))),
+    "odds_game_xref",
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Odds API player names → `player_key`. Each name is matched only against players on the
+# MAGIC two teams in that game, which keeps same-name players apart. Rules, in order:
+# MAGIC 1. **exact** after normalizing (accents, punctuation, Jr./III suffixes)
+# MAGIC 2. **nickname**: same last name and one first name starts with the other (Nic/Nicolas, Herb/Herbert)
+# MAGIC 3. **all_words**: every word of exactly one NBA.com name appears ("Wembanyama Victor", "Brook Robert Lopez")
+# MAGIC 4. **fuzzy**: closest name by similarity ≥ 0.85, only if no other candidate is close
+# MAGIC 5. **surname**: exactly one candidate's surname appears and a first-name initial agrees
+# MAGIC    ("Alfred Joel Horford Reynoso" → Al Horford)
+# MAGIC
+# MAGIC A name shared by two different candidates (Chris Johnson ×2 in 2012-13) is left unmatched as
+# MAGIC `ambiguous_same_name` rather than guessed.
+# MAGIC
+# MAGIC Rules 1-2 run against that game's box score, then the teams' season rosters (a player with a
+# MAGIC posted line who then sat out has no box-score row). For games not played yet the roster also
+# MAGIC includes every player whose latest game (preseason included) was for either team. Rules 3-5 run last, against both full
+# MAGIC rosters, so a loose rule can never pick a teammate when the right player simply sat out.
+
+# COMMAND ----------
+
+
+def season_of_date(d):
+    y = d.year if d.month >= 8 else d.year - 1
+    return f"{y}-{(y + 1) % 100:02d}"
+
+
+wanted = (
+    odds_player_points.select("event_id", "player_name").distinct()
+    .join(odds_events.join(odds_game_xref.select("event_id", "game_id"), "event_id", "left")
+          .select("event_id", "game_id", "game_date", "home_team", "away_team"), "event_id")
+    .toPandas()
+)
+wanted["season"] = wanted.game_date.map(season_of_date)
+apg = all_player_games.select("game_id", "season", "game_date", "team", "player_key", "player")
+box = apg.join(odds_game_xref.select("game_id"), "game_id").select("game_id", "player", "player_key").toPandas()
+seasons = spark.createDataFrame([(x,) for x in sorted(set(wanted.season))], "season string")
+season_roster = apg.join(seasons, "season").select("season", "team", "player_key", "player").distinct().toPandas()
+preseason = (
+    espn_player_box.join(espn_games.where("season_type = 'preseason'").select("espn_game_id"), "espn_game_id")
+    .join(key_of, "espn_player_id", "left").select("game_date", "team", player_key.alias("player_key"), "player")
+)
+# Each player's latest team (preseason included): the roster for games not played yet.
+player_latest_team = save(
+    apg.select("game_date", "team", "player_key", "player").unionByName(preseason)
+    .withColumn("rn", F.row_number().over(Window.partitionBy("player_key").orderBy(F.desc("game_date")))).where("rn = 1")
+    .select("player_key", "player", "team", F.col("game_date").alias("last_game_date")),
+    "player_latest_team",
+)
+latest_team = player_latest_team.toPandas()
+
+box_by_game = {k: name_index(zip(d.player, d.player_key)) for k, d in box.groupby("game_id")}
+roster_by_team = {k: name_index(zip(d.player, d.player_key)) for k, d in season_roster.groupby(["season", "team"])}
+current_roster = {k: name_index(zip(d.player, d.player_key)) for k, d in latest_team.groupby("team")}
+
+rows = []
+for r in wanted.itertuples(index=False):
+    played = isinstance(r.game_id, str)
+    rosters = [roster_by_team.get((r.season, t), {}) for t in (r.home_team, r.away_team)]
+    if not played:
+        rosters += [current_roster.get(t, {}) for t in (r.home_team, r.away_team)]
+    key, method = match_player(r.player_name, box_by_game.get(r.game_id, {}) if played else {}, merge(*rosters))
+    nba_id = int(key) if key is not None and key.isdigit() else None
+    rows.append((r.event_id, r.game_id if played else None, r.player_name, key, nba_id, method))
+
+odds_player_xref = save(
+    spark.createDataFrame(
+        pd.DataFrame(rows, columns=["event_id", "game_id", "player_name", "player_key", "player_id", "match_method"]),
+        "event_id string, game_id string, player_name string, player_key string, player_id long, match_method string",
+    ),
+    "odds_player_xref",
+)
+
+# COMMAND ----------
+
 # MAGIC %md ## Quality checks
 
 # COMMAND ----------
 
 checks = {
     "odds games": odds_events.count(),
-    "odds games matched to NBA.com (games through 2025-26)": odds_game_xref.count(),
-    "odds games in NBA.com date range but unmatched": odds_events.join(odds_game_xref, "event_id", "left_anti")
-        .where(F.col("game_date") <= nba_games.agg(F.max("game_date")).first()[0]).count(),
+    "odds games matched to a played game": odds_game_xref.count(),
+    "odds games already played but unmatched": odds_events.join(odds_game_xref, "event_id", "left_anti")
+        .where(F.col("game_date") <= all_games.agg(F.max("game_date")).first()[0]).count(),
     "prop rows": odds_player_points.count(),
     "prop rows with a missing over or under price": odds_player_points.where("over_price IS NULL OR under_price IS NULL").count(),
     "player-game names to match": odds_player_xref.count(),
-    "player-game names unmatched": odds_player_xref.where("player_id IS NULL").count(),
+    "player-game names unmatched": odds_player_xref.where("player_key IS NULL").count(),
     "moneyline rows": odds_moneylines.count(),
     "ESPN player-game rows": espn_player_box.count(),
+    "timeline games (NBA.com + ESPN-only)": all_games.count(),
+    "timeline games from ESPN": all_games.where("source = 'espn'").count(),
     "ESPN games matched to NBA.com": espn_game_xref.count(),
     "ESPN players": espn_player_xref.count(),
     "ESPN players matched to NBA.com": espn_player_xref.where("player_id IS NOT NULL").count(),
@@ -435,7 +554,7 @@ checks = {
 }
 display(spark.createDataFrame([(k, int(v)) for k, v in checks.items()], "check string, value long"))
 display(odds_player_xref.groupBy("match_method").count().orderBy(F.desc("count")))
-display(odds_player_xref.where("player_id IS NULL").groupBy("player_name").count().orderBy(F.desc("count")).limit(50))
+display(odds_player_xref.where("player_key IS NULL").groupBy("player_name").count().orderBy(F.desc("count")).limit(50))
 display(espn_player_xref.groupBy("match_method").count().orderBy(F.desc("count")))
 # Stat-line matches whose names differ: worth a glance, but the stats decide.
 display(espn_player_xref.where(F.col("match_method") == "stat_line")

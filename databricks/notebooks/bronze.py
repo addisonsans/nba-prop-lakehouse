@@ -65,8 +65,9 @@ def ingest_json_files(source: str, table: str, path_fields: list[str], extra=Non
 path = F.col("_metadata.file_path")
 ingest_json_files(
     "raw/odds/basketball_nba", "odds", ["snapshot_date", "snapshot_ts", "event"],
-    # events = game list, event = one game's player props, h2h = moneylines for the slate
-    extra={"file_kind": F.regexp_extract(path, r"/(events|event|h2h)(?:=[^/]*)?\.json\.gz$", 1)},
+    # events = game list, event = one game's player props, h2h = moneylines for the slate,
+    # game_lines = moneylines + spreads + totals for the slate
+    extra={"file_kind": F.regexp_extract(path, r"/(events|event|h2h|game_lines)(?:=[^/]*)?\.json\.gz$", 1)},
 )
 ingest_json_files("raw/espn/scoreboard", "espn_scoreboard", ["game_date"])
 ingest_json_files("raw/espn/summary", "espn_summary", ["game_date", "event"])

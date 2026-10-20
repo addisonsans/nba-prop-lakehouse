@@ -19,6 +19,8 @@ Env:
 S3 layout:
   raw/odds/basketball_nba/snapshot_date=YYYY-MM-DD/snapshot_ts=<ts>/events.json.gz
   raw/odds/basketball_nba/snapshot_date=YYYY-MM-DD/snapshot_ts=<ts>/event=<id>.json.gz
+  raw/odds/basketball_nba/snapshot_date=YYYY-MM-DD/snapshot_ts=<ts>/game_lines.json.gz
+    (moneyline, spread and total for every game on the slate: one call, 3 credits)
   raw/espn/injuries/snapshot_date=YYYY-MM-DD/snapshot_ts=<ts>.json.gz
 """
 
@@ -37,6 +39,7 @@ log.setLevel(logging.INFO)
 
 ODDS_BASE = "https://api.the-odds-api.com/v4"
 SPORT = "basketball_nba"
+GAME_MARKETS = "h2h,spreads,totals"
 
 
 class CreditsExhausted(RuntimeError):
@@ -87,6 +90,18 @@ def snapshot(store: Store, key: str, now: datetime) -> dict:
             envelope(body, source=url, params=odds_params, extra={"credits_remaining": remaining, "credits_last": headers.get("x-requests-last")}),
         )
         stats["written"] += 1
+
+    # Game lines for the whole slate in one bulk call, after the props (the priority).
+    lines_params = {"apiKey": key, "regions": regions, "markets": GAME_MARKETS, "oddsFormat": "american",
+                    "commenceTimeFrom": _iso(now), "commenceTimeTo": _iso(now + timedelta(hours=lookahead))}
+    lines_cost = len(GAME_MARKETS.split(",")) * len(regions.split(","))
+    if events and (remaining is None or remaining - lines_cost >= min_credits):
+        url = f"{ODDS_BASE}/sports/{SPORT}/odds"
+        body, headers = http.get_json(url, lines_params)
+        remaining = _remaining(headers) or remaining
+        store.put_json(f"{prefix}/game_lines.json.gz",
+                       envelope(body, source=url, params=lines_params, extra={"credits_remaining": remaining}))
+        stats["game_lines"] = len(body)
     stats["credits_remaining"] = remaining
     return stats
 
