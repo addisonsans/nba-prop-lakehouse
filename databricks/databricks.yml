@@ -59,6 +59,14 @@ resources:
           notebook_task:
             notebook_path: ./notebooks/model_backtest.py
 
+    model_experiments:
+      name: nba-points-model-experiments
+      description: Compare candidate models on the development season (2025-26 stays locked).
+      tasks:
+        - task_key: compare
+          notebook_task:
+            notebook_path: ./notebooks/model_experiments.py
+
 targets:
   free:
     default: true
