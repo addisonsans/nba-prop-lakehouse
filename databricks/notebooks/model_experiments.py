@@ -172,3 +172,54 @@ with mlflow.start_run(run_name=f"selection {DEV_TEST}"):
 print("dropped:", dropped)
 spark.createDataFrame(selection).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(f"{G}.feature_selection_dev")
 display(selection)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Hyperparameter tuning
+# MAGIC Settings are chosen on points prediction for the season *before* the development season (train
+# MAGIC ≤ 2022-23, validate on 2023-24 games, ~26k rows: much less noisy than prop outcomes). The winner is
+# MAGIC then checked once on the 2024-25 props against the current settings.
+
+# COMMAND ----------
+
+from sklearn.metrics import mean_poisson_deviance
+
+grid_rng = np.random.default_rng(1)
+space = {"learning_rate": [0.03, 0.05, 0.1], "max_leaf_nodes": [15, 31, 63], "min_samples_leaf": [50, 200, 800],
+         "l2_regularization": [0.0, 1.0, 5.0]}
+trials = [dict(GBM_PARAMS)]  # the current settings first
+while len(trials) < 13:
+    t = {**GBM_PARAMS, **{k: grid_rng.choice(v).item() for k, v in space.items()}}
+    if t not in trials:
+        trials.append(t)
+
+tune_train, tune_valid = games_pd[games_pd["season"] < PRIOR], games_pd[games_pd["season"] == PRIOR]
+tuning = []
+for i, params in enumerate(trials):
+    m = HistGradientBoostingRegressor(**params).fit(tune_train[FEATURES], tune_train["pts"])
+    pred = np.clip(m.predict(tune_valid[FEATURES]), 1e-3, None)
+    tuning.append({"trial": i, **{k: params[k] for k in space}, "trees_used": m.n_iter_,
+                   "poisson_deviance": float(mean_poisson_deviance(tune_valid["pts"], pred)),
+                   "mae": float(np.mean(np.abs(pred - tune_valid["pts"])))})
+tuning = pd.DataFrame(tuning).sort_values("poisson_deviance")
+spark.createDataFrame(tuning).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(f"{G}.tuning_dev")
+display(tuning)
+
+# COMMAND ----------
+
+INT_PARAMS = {"max_leaf_nodes", "min_samples_leaf"}
+best_params = {**GBM_PARAMS, **{k: int(tuning.iloc[0][k]) if k in INT_PARAMS else float(tuning.iloc[0][k]) for k in space}}
+default_params = dict(GBM_PARAMS)
+checks = []
+for label, params in [("current settings", default_params), ("tuned settings", best_params)]:
+    GBM_PARAMS = params  # fit_mu reads the shared GBM_PARAMS
+    checks.append({"settings": label, **{k: params[k] for k in space}, **score_feature_set(ALL_FEATURES)})
+GBM_PARAMS = default_params
+checks = pd.DataFrame(checks)
+with mlflow.start_run(run_name=f"tuning {DEV_TEST}"):
+    mlflow.log_params({f"best_{k}": best_params[k] for k in space})
+    mlflow.log_table(tuning, "tuning.json")
+    mlflow.log_table(checks, "dev_check.json")
+spark.createDataFrame(checks).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(f"{G}.tuning_check_dev")
+display(checks)

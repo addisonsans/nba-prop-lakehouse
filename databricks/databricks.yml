@@ -67,6 +67,14 @@ resources:
           notebook_task:
             notebook_path: ./notebooks/model_experiments.py
 
+    ablation_teammates_out:
+      name: nba-points-model-ablation-teammates-out
+      description: With vs without the teammates-out features on the development season, with a paired bootstrap.
+      tasks:
+        - task_key: ablation
+          notebook_task:
+            notebook_path: ./notebooks/ablation_teammates_out.py
+
 targets:
   free:
     default: true
