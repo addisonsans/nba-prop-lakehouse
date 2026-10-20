@@ -11,7 +11,7 @@ resources:
   jobs:
     bronze_ingest:
       name: nba-lakehouse-bronze-silver-gold
-      description: Load new landing-volume files into nba.bronze (Auto Loader), then rebuild nba.silver and nba.gold.
+      description: Load new landing-volume files into nba.bronze (Auto Loader), then rebuild nba.silver and nba.gold, then score tonight's props and lock new picks.
       # 6:30am ET picks up the 6am box scores; 5:30pm ET picks up the 5pm odds snapshot.
       schedule:
         quartz_cron_expression: "0 30 6,17 * * ?"
@@ -34,6 +34,11 @@ resources:
             - task_key: silver
           notebook_task:
             notebook_path: ./notebooks/gold.py
+        - task_key: picks
+          depends_on:
+            - task_key: gold
+          notebook_task:
+            notebook_path: ./notebooks/picks.py
 
     model_backtest:
       name: nba-lakehouse-model-backtest

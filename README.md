@@ -90,8 +90,15 @@ aws lambda invoke --profile nba-lakehouse --region us-east-2 \
   Tonight's props sit in the same table with no result, so the model scores them the way it was backtested.
   54,632 graded props from May 2023 to June 2026.
 
+- **model:** `model_common` (shared), `model_backtest` (on-demand job, MLflow-tracked walk-forward test against
+  real lines, writes `gold.backtest_picks`) and `picks` (daily): expected points from a Poisson gradient-boosted
+  model, a negative binomial spread around it, blended with the market's no-vig probability. Picks need ≥ 2%
+  expected value at the best price, lines < 3h old, ≥ 10 career games, and the player not listed Out.
+  They're appended once to `gold.pick_log` before tip-off and never changed; `gold.pick_record` grades them.
+
 ```bash
-cd databricks && databricks bundle deploy && databricks bundle run bronze_ingest   # bronze -> silver -> gold
+cd databricks && databricks bundle deploy && databricks bundle run bronze_ingest   # bronze -> silver -> gold -> picks
+databricks bundle run model_backtest                                              # re-run the backtest
 ```
 
 ## Historical backfill
